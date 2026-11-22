@@ -1,0 +1,256 @@
+-- =====================================================================
+-- भाग 1: प्लांट रीडिंग वेबसाइट का डेटाबेस (ETP / WTP / STP)
+-- इसे Supabase > SQL Editor में पूरा चिपकाकर "Run" दबाइए।
+-- =====================================================================
+
+create extension if not exists pgcrypto;
+
+-- ---------------------------------------------------------------------
+-- 1. ग्राहक (उद्योग) की तालिका
+-- ---------------------------------------------------------------------
+create table if not exists public.clients (
+  id               uuid primary key default gen_random_uuid(),
+  client_code      text unique not null,            -- जैसे Suraj@ETP
+  industry_name    text not null,
+  mobile           text not null,
+  email            text not null,
+  services         text[] not null
+                   check (services <@ array['ETP','WTP','STP']::text[]
+                          and cardinality(services) > 0),
+  status           text not null default 'active'
+                   check (status in ('active','blocked')),
+  free_until       date not null default (current_date + interval '6 months'),
+  paid_until       date,                            -- भुगतान के बाद की तारीख़
+  monthly_fee      int  not null default 1000,      -- रुपये प्रति माह
+  pro_password_hash text,                           -- डाउनलोड वाला प्रो पासवर्ड
+  email_verified   boolean not null default false,
+  mobile_verified  boolean not null default false,
+  created_at       timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------------------
+-- 2. उपयोगकर्ता की भूमिका (admin / client / operator)
+-- ---------------------------------------------------------------------
+create table if not exists public.profiles (
+  user_id    uuid primary key references auth.users(id) on delete cascade,
+  role       text not null check (role in ('admin','client','operator')),
+  client_id  uuid references public.clients(id) on delete cascade,
+  full_name  text,
+  must_change_password boolean not null default true,
+  created_at timestamptz not null default now(),
+  check ( (role = 'admin' and client_id is null)
+       or (role <> 'admin' and client_id is not null) )
+);
+
+-- ---------------------------------------------------------------------
+-- 3. रीडिंग की तालिका
+-- ---------------------------------------------------------------------
+create table if not exists public.readings (
+  id              bigint generated always as identity primary key,
+  client_id       uuid not null references public.clients(id) on delete cascade,
+  plant_type      text not null check (plant_type in ('ETP','WTP','STP')),
+  point           text not null check (point in (
+                    'power','inlet','outlet','sewage_inlet',
+                    'product_water','reject_water',
+                    'borewell_1','borewell_2','borewell_3')),
+  borewell_kind   text check (borewell_kind in ('commercial','domestic')),
+  initial_reading numeric(14,3) not null,
+  final_reading   numeric(14,3) not null check (final_reading >= initial_reading),
+  consumption     numeric(14,3) generated always as (final_reading - initial_reading) stored,
+  operator_name   text,                              -- सिर्फ़ power वाली पंक्ति पर
+  source          text not null default 'manual' check (source in ('manual','photo')),
+  latitude        numeric(9,6)  not null,
+  longitude       numeric(9,6)  not null,
+  entered_by      uuid not null references auth.users(id),
+  entered_at      timestamptz not null default now(),  -- तारीख़ और समय अपने-आप
+  reading_date    date not null default current_date
+);
+
+-- तेज़ी के लिए इंडेक्स (50,000 उपयोगकर्ताओं तक के लिए ज़रूरी)
+create index if not exists idx_readings_client_date
+  on public.readings (client_id, reading_date desc);
+create index if not exists idx_readings_client_point
+  on public.readings (client_id, plant_type, point, reading_date desc);
+create index if not exists idx_profiles_client on public.profiles (client_id);
+
+-- ---------------------------------------------------------------------
+-- 4. एडमिन के सुधार का पूरा रिकॉर्ड (किसने, कब, पुराना, नया)
+-- ---------------------------------------------------------------------
+create table if not exists public.reading_corrections (
+  id          bigint generated always as identity primary key,
+  reading_id  bigint not null,
+  client_id   uuid not null,
+  changed_by  uuid not null,
+  changed_at  timestamptz not null default now(),
+  old_initial numeric(14,3),
+  old_final   numeric(14,3),
+  new_initial numeric(14,3),
+  new_final   numeric(14,3)
+);
+
+create or replace function public.log_reading_correction()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.reading_corrections
+    (reading_id, client_id, changed_by, old_initial, old_final, new_initial, new_final)
+  values
+    (old.id, old.client_id, auth.uid(),
+     old.initial_reading, old.final_reading, new.initial_reading, new.final_reading);
+  return new;
+end $$;
+
+drop trigger if exists trg_log_correction on public.readings;
+create trigger trg_log_correction
+  after update on public.readings
+  for each row execute function public.log_reading_correction();
+
+-- ---------------------------------------------------------------------
+-- 5. सहायक फ़ंक्शन
+-- ---------------------------------------------------------------------
+create or replace function public.is_admin()
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.profiles
+                 where user_id = auth.uid() and role = 'admin');
+$$;
+
+create or replace function public.my_client_id()
+returns uuid language sql stable security definer set search_path = public as $$
+  select client_id from public.profiles where user_id = auth.uid();
+$$;
+
+create or replace function public.client_can_enter(p_client uuid, p_plant text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.clients c
+    where c.id = p_client
+      and c.status = 'active'
+      and p_plant = any (c.services)
+  );
+$$;
+
+-- ---------------------------------------------------------------------
+-- 6. विशिष्ट आईडी बनाना (जैसे Suraj@ETP, डुप्लिकेट पर अंत में संख्या)
+--    नियम: छोटा नाम (5 अक्षर तक) पूरा; लंबा नाम छोटा करके।
+-- ---------------------------------------------------------------------
+create or replace function public.make_client_code(p_name text, p_utility text)
+returns text language plpgsql as $$
+declare
+  words   text[];
+  w1      text;
+  w2      text;
+  base    text;
+  cand    text;
+  n       int := 1;
+begin
+  words := regexp_split_to_array(trim(regexp_replace(p_name, '[^A-Za-z ]', '', 'g')), '\s+');
+  w1 := initcap(coalesce(words[1], 'Client'));
+  w2 := initcap(coalesce(words[2], ''));
+
+  if length(w1) <= 5 and w2 = '' then
+    base := w1;
+  elsif length(w1) <= 5 then
+    base := w1;
+  elsif w2 <> '' then
+    base := left(w1, 3) || left(w2, 2);   -- Narayan Laboratory -> NarLa
+  else
+    base := left(w1, 5);
+  end if;
+
+  cand := base || '@' || upper(p_utility);
+  while exists (select 1 from public.clients where client_code = cand) loop
+    n := n + 1;
+    cand := base || n::text || '@' || upper(p_utility);
+  end loop;
+  return cand;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- 7. प्रो पासवर्ड (डाउनलोड के लिए) - एडमिन तय करेगा, कोड हैश में रखा जाता है
+-- ---------------------------------------------------------------------
+create or replace function public.set_pro_password(p_client uuid, p_password text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_admin() then raise exception 'सिर्फ़ एडमिन'; end if;
+  update public.clients
+     set pro_password_hash = crypt(p_password, gen_salt('bf'))
+   where id = p_client;
+end $$;
+
+create or replace function public.check_pro_password(p_password text)
+returns boolean language plpgsql security definer set search_path = public as $$
+declare h text;
+begin
+  select c.pro_password_hash into h
+    from public.clients c where c.id = public.my_client_id();
+  return h is not null and h = crypt(p_password, h);
+end $$;
+
+-- ---------------------------------------------------------------------
+-- 8. मुफ़्त अवधि ख़त्म होने पर खाता अपने-आप बंद
+-- ---------------------------------------------------------------------
+create or replace function public.block_expired_clients()
+returns void language sql security definer set search_path = public as $$
+  update public.clients
+     set status = 'blocked'
+   where status = 'active'
+     and free_until < current_date
+     and (paid_until is null or paid_until < current_date);
+$$;
+-- रोज़ रात चलाने के लिए (Supabase में Database > Extensions से pg_cron चालू करें):
+-- select cron.schedule('block-expired', '30 18 * * *',
+--                      'select public.block_expired_clients()');
+
+-- ---------------------------------------------------------------------
+-- 9. सुरक्षा नियम (Row Level Security)
+--    हर उद्योग सिर्फ़ अपना डेटा देखेगा; एडमिन सब कुछ।
+-- ---------------------------------------------------------------------
+alter table public.clients             enable row level security;
+alter table public.profiles            enable row level security;
+alter table public.readings            enable row level security;
+alter table public.reading_corrections enable row level security;
+
+-- clients
+drop policy if exists clients_admin_all  on public.clients;
+drop policy if exists clients_read_own   on public.clients;
+create policy clients_admin_all on public.clients
+  for all using (public.is_admin()) with check (public.is_admin());
+create policy clients_read_own on public.clients
+  for select using (id = public.my_client_id());
+
+-- profiles
+drop policy if exists profiles_admin_all on public.profiles;
+drop policy if exists profiles_read_own  on public.profiles;
+create policy profiles_admin_all on public.profiles
+  for all using (public.is_admin()) with check (public.is_admin());
+create policy profiles_read_own on public.profiles
+  for select using (user_id = auth.uid());
+
+-- readings
+drop policy if exists readings_admin_all   on public.readings;
+drop policy if exists readings_read_own    on public.readings;
+drop policy if exists readings_insert_own  on public.readings;
+create policy readings_admin_all on public.readings
+  for all using (public.is_admin()) with check (public.is_admin());
+create policy readings_read_own on public.readings
+  for select using (client_id = public.my_client_id());
+create policy readings_insert_own on public.readings
+  for insert with check (
+    client_id  = public.my_client_id()
+    and entered_by = auth.uid()
+    and public.client_can_enter(client_id, plant_type)
+  );
+-- ध्यान दें: ग्राहक या कर्मचारी रीडिंग बदल/मिटा नहीं सकते, सिर्फ़ एडमिन।
+
+-- सुधार का रिकॉर्ड सिर्फ़ एडमिन देख सकता है
+drop policy if exists corrections_admin_read on public.reading_corrections;
+create policy corrections_admin_read on public.reading_corrections
+  for select using (public.is_admin());
+
+-- ---------------------------------------------------------------------
+-- 10. पहला एडमिन (विकास जी) बनाना
+--    पहले Supabase > Authentication > Users में अपना ईमेल और पासवर्ड से
+--    उपयोगकर्ता बनाइए, फिर नीचे की पंक्ति में अपना ईमेल लिखकर चलाइए:
+-- ---------------------------------------------------------------------
+-- insert into public.profiles (user_id, role, full_name, must_change_password)
+-- select id, 'admin', 'Vikas', false from auth.users
+--  where email = 'यहाँ-अपना-ईमेल-लिखें';
